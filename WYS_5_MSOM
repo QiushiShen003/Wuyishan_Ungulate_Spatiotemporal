@@ -1,0 +1,790 @@
+---
+title: "wys_7(5)_occupancy"
+output: html_document
+date: "2026-05-08"
+---
+# Spatial Thinning
+```{r}
+library(sf)
+library(dplyr)
+library(readxl)
+library(camtrapR)
+library(jagsUI) # Or library(ubms) to use Stan engine
+library(dplyr)
+
+camera_info <- read_excel("Camera_Info_12_4.xlsx")
+
+spatial_thinning <- function(df, threshold = 10) {
+  # 1. Convert to sf object to calculate exact great-circle distances
+  df_sf <- st_as_sf(df, coords = c("Longitude", "Latitude"), crs = 4326)
+  
+  # 2. Calculate distance matrix
+  dist_matrix <- st_distance(df_sf)
+  diag(dist_matrix) <- NA # Exclude diagonal self-distances (0)
+  
+  # Check for camera pairs below distance threshold
+  too_close <- which(dist_matrix < units::set_units(threshold, "m"), arr.ind = TRUE)
+  
+  if(nrow(too_close) == 0) {
+    message("All inter-camera distances exceed threshold; no thinning needed.")
+    # Return sorted by Site if no thinning is required
+    return(df[order(df$Site), ])
+  }
+  
+  # 3. Greedy randomized thinning algorithm
+  keep_sites <- c()
+  remaining_sites <- 1:nrow(df)
+  
+  set.seed(123) # Ensure reproducibility
+  
+  while(length(remaining_sites) > 0) {
+    # Avoid single-element sampling issue in R base sample()
+    if (length(remaining_sites) == 1) {
+      pick <- remaining_sites
+    } else {
+      pick <- sample(remaining_sites, 1)
+    }
+    
+    # Retain selected camera
+    keep_sites <- c(keep_sites, pick)
+    
+    # Identify all neighbors within distance threshold
+    neighbors <- which(dist_matrix[pick, ] < units::set_units(threshold, "m"))
+    
+    # Remove current camera and adjacent neighbors from candidate pool
+    to_remove <- c(pick, neighbors)
+    remaining_sites <- setdiff(remaining_sites, to_remove)
+  }
+  
+  # 4. Subset retained spatially independent cameras
+  df_thinned <- df[keep_sites, ]
+  
+  # 5. Reorder output dataframe by Site
+  df_thinned <- df_thinned[order(df_thinned$Site), ]
+  
+  return(df_thinned)
+}
+
+# === Execute thinning ===
+# Thin cameras spaced < 10 meters apart
+camera_info_thinned <- spatial_thinning(camera_info, threshold = 10)
+
+# Print summary to verify output
+cat(sprintf("Spatial thinning complete: Original sites = %d, Retained sites = %d\n", 
+            nrow(camera_info), nrow(camera_info_thinned)))
+
+camera_info_thinned
+```
+
+# Create Operation Matrices
+```{r}
+# Run data processing from wys_1 to obtain PtTime column
+
+# Determine retrieval date
+camera_info_thinned <- camera_info_thinned %>%
+  mutate(across(c(Install, Check1, Check2, Check3), as.Date)) %>%
+  # coalesce prioritizes Check3, then Check2, then Check1
+  mutate(Retrieval_Date = coalesce(Check3, Check2, Check1)) %>%
+  
+  mutate(Effort_Days = as.numeric(Retrieval_Date - Install))
+
+# Camera operation matrix
+cam_op_matrix <- cameraOperation(CTtable = camera_info_thinned,
+                                 stationCol = "Site",
+                                 setupCol = "Install",          # Setup date
+                                 retrievalCol = "Retrieval_Date", # Final retrieval date
+                                 dateFormat = "%Y-%m-%d")
+
+# Split operation matrix by year
+target_years <- c("2020","2021", "2022", "2023")
+
+# Get column names of operation matrix (formatted as "YYYY-MM-DD")
+all_dates <- colnames(cam_op_matrix)
+
+# 1. Create empty list to store yearly matrices
+cam_op_matrix_list <- list()
+
+# 2. Loop to extract yearly submatrices
+for(yr in target_years) {
+  # Find column indices starting with target year (regex matching YYYY)
+  cols_in_year <- grep(paste0("^", yr), all_dates)
+  
+  # Extract columns if data exists; otherwise issue warning
+  if(length(cols_in_year) > 0) {
+    cam_op_matrix_list[[yr]] <- cam_op_matrix[, cols_in_year, drop = FALSE]
+  } else {
+    warning(paste("Warning: No data found for year", yr, "in cam_op_matrix!"))
+  }
+}
+
+# Inspect split results
+# Check dimensions for 2022 matrix (rows = stations, columns = operational days in that year)
+dim(cam_op_matrix_list[["2022"]])
+```
+# Temporal Data Preparation
+```{r}
+library(dplyr)
+library(readxl)
+data <- read_excel("wys_data_12_3.xlsx")
+
+result <- data %>%
+  group_by(Site) %>%
+  filter(n_distinct(Habitat) == 4) %>%
+  arrange(Site)  # Sort by site ID for easy viewing
+
+# View results
+print(result)
+
+# Convert to site-specific accurate time
+library(hms)
+data <- data %>% mutate(Time_hms = as_hms(Time))
+data <- data %>%
+  mutate(time_radians = as.numeric(Time_hms)/ 86400 * 2 * pi)
+
+
+# Set fixed coordinates for the study area
+study_longitude <- 117.7  # Longitude: 117.7° E
+study_latitude <- 27.7    # Latitude: 27.7° N
+
+# Define function to calculate equation of time
+equation_of_time <- function(date) {
+    # Calculate day of the year
+    J <- as.numeric(format(date, "%j"))
+    
+    # Calculate equation of time (minutes)
+    B <- 2 * pi * (J - 81) / 365
+    Et <- 9.87 * sin(2*B) - 7.53 * cos(B) - 1.5 * sin(B)
+    
+    return(Et)
+}
+
+# Define conversion function
+convert_to_solar_time <- function(Time) {
+    # Ensure input is POSIXct format
+    datetime <- as.POSIXct(Time)
+    
+    # Timezone offset (China is UTC+8)
+    timezone_offset <- 8
+    
+    # Calculate longitude time difference (4 minutes per degree)
+    longitude_time_diff <- (study_longitude - (timezone_offset * 15)) * 4 / 60
+    
+    # Calculate equation of time correction (hours)
+    et <- equation_of_time(as.Date(Time)) / 60
+    
+    # Convert time to decimal hours
+    hour <- as.numeric(format(Time, "%H"))
+    minute <- as.numeric(format(Time, "%M"))
+    second <- as.numeric(format(Time, "%S"))
+    
+    time_in_hours <- hour + minute/60 + second/3600
+    
+    # Calculate apparent solar time
+    solar_time <- time_in_hours + longitude_time_diff + et
+    
+    # Handle values exceeding 24 or below 0
+    solar_time <- solar_time %% 24
+    
+    return(solar_time)
+}
+
+# Apply conversion and create new column
+data$Time_adj <- sapply(data$Time, convert_to_solar_time)
+
+data$time_adjusted <- format(
+  as.POSIXct(
+    (data$Time_adj %/% 1) * 3600 +  # Convert integer hour part to seconds
+    (data$Time_adj %% 1) * 60 * 60,  # Convert decimal part to minutes and then to seconds
+    origin = "1970-01-01", 
+    tz = "UTC"
+  ), 
+  "%H:%M:%S"
+)
+
+data <- data %>%
+  mutate(Longitude = as.numeric(Longitude))
+data$time_adjusted <- as_hms(data$time_adjusted)
+data$TimeRad <- as.numeric(data$Time_adj) * 2 * pi/24
+data
+data$PtTime <- as.POSIXct(
+  paste(
+    format(data$Date, "%Y-%m-%d"),
+    format(data$time_adjusted, "%H:%M:%S")
+  ),
+  format = "%Y-%m-%d %H:%M:%S",
+  tz = "Asia/Shanghai"  
+)
+```
+
+# Construct Detection Histories
+```{r}
+# 2. Convert raw detections to detection histories using camtrapR
+target_species <- c("Elaphodus cephalophus", "Muntiacus reevesi", "Sus scrofa", "Capricornis milneedwardsii")
+
+all_sites <- rownames(cam_op_matrix) 
+
+dh_list_4d <- list()
+
+for (sp in target_species) {
+  dh_list_4d[[sp]] <- list() 
+  
+  for (yr in target_years) {
+    # 1. Extract camera matrix for the year
+    camOp_yr <- cam_op_matrix_list[[yr]]
+    
+    # 2. Identify active cameras with >= 1 operational day in that year
+    # rowSums(!is.na()) > 0 indicates non-NA active records
+    valid_stations <- rownames(camOp_yr)[rowSums(!is.na(camOp_yr)) > 0]
+    
+    # 3. Subset operation matrix and detections for active cameras
+    camOp_yr_valid <- camOp_yr[valid_stations, , drop = FALSE]
+    
+    # Extract year from PtTime and filter records to active cameras
+    data_yr <- subset(data, format(as.POSIXct(PtTime), "%Y") == yr & Site %in% valid_stations)
+    
+    # 4. Generate detection history
+    dh <- detectionHistory(recordTable = data_yr,
+                           camOp = camOp_yr_valid,
+                           stationCol = "Site",
+                           speciesCol = "Species",
+                           species = sp, 
+                           recordDateTimeCol = "PtTime",
+                           occasionLength = 7,
+                           day1 = "survey")
+                           
+    dh_matrix <- dh$detection_history
+    
+    # 5. Pad matrix to include all camera stations across full array
+    full_matrix <- matrix(NA, 
+                          nrow = length(all_sites), 
+                          ncol = ncol(dh_matrix),
+                          dimnames = list(all_sites, colnames(dh_matrix)))
+    
+    # Populate template matrix with active camera records
+    full_matrix[rownames(dh_matrix), ] <- dh_matrix
+    
+    # Store in list
+    dh_list_4d[[sp]][[yr]] <- full_matrix
+  }
+}
+```
+
+# Construct 4D Array
+```{r}
+n_species <- length(target_species)
+n_sites <- length(all_sites)
+n_years <- length(target_years)
+
+# Find maximum number of sampling occasions (k) across all years
+# Query column count across years for maximum occasion length
+max_occasions <- max(sapply(dh_list_4d[[target_species[1]]], ncol))
+
+# Create final 4D array
+y_array <- array(NA, dim = c(n_species, n_sites, n_years, max_occasions))
+
+# Populate data into array
+for(i in 1:n_species) {
+  sp <- target_species[i]
+  for(t in 1:n_years) {
+    yr <- target_years[t]
+    
+    temp_matrix <- dh_list_4d[[sp]][[yr]]
+    
+    # Replace NaN with NA for JAGS compatibility
+    temp_matrix[is.nan(temp_matrix)] <- NA 
+    
+    # Insert into 4D array
+    # Specify column range (1:ncol) since temp_matrix may have fewer occasions than max_occasions
+    y_array[i, , t, 1:ncol(temp_matrix)] <- temp_matrix
+  }
+}
+
+# Check dimensions of final array
+dim(y_array)
+# Output array structure: [n_species, n_sites, n_years, n_occasions]
+```
+
+# Process Habitat Covariates and Distance Matrix
+```{r}
+library(dplyr)
+# Prerequisite: Run spatial thinning from wys_5 to remove cameras < 10 m apart
+
+# 1. Clean leading/trailing whitespace
+all_sites_clean <- trimws(as.character(all_sites))
+
+# Extract data from spatially thinned camera metadata (camera_info_thinned)
+camera_info_thinned$Site_clean <- trimws(as.character(camera_info_thinned$Site))
+
+# 2. Construct standardized station skeleton dataframe
+site_skeleton <- data.frame(Site_clean = all_sites_clean)
+
+# 3. Join environmental covariates from thinned table to skeleton
+site_covs_fixed <- site_skeleton %>%
+  left_join(
+    camera_info_thinned %>% 
+      # Select required columns: Site, Habitat, Longitude, Latitude, Elevation
+      select(Site_clean, Habitat, Longitude, Latitude, Elevation) %>%
+      distinct(Site_clean, .keep_all = TRUE),
+    by = "Site_clean"
+  )
+
+# --------- Check for missing values ---------
+if(any(is.na(site_covs_fixed$Longitude))) {
+  bad_sites <- site_covs_fixed$Site_clean[is.na(site_covs_fixed$Longitude)]
+  stop(paste("Error: Missing coordinate data for stations:", paste(bad_sites, collapse = ", ")))
+}
+
+# ==========================================
+# Step A1: Process elevation and habitat covariates
+# ==========================================
+# 1. Standardize elevation
+elevation_scaled <- scale(site_covs_fixed$Elevation)[,1]
+
+# 2. Convert habitat to numeric integer index (1, 2, 3...)
+site_covs_fixed$habitat_index <- as.numeric(as.factor(site_covs_fixed$Habitat))
+habitat_vector <- site_covs_fixed$habitat_index
+n_habitats <- length(unique(habitat_vector))
+
+# Print habitat index reference table
+habitat_levels <- levels(as.factor(site_covs_fixed$Habitat))
+cat("\n[Habitat Index Reference Table]\n")
+print(data.frame(Index = 1:length(habitat_levels), Habitat = habitat_levels))
+
+# ==========================================
+# Step A2: Process spatial coordinates and compute distance matrix
+# ==========================================
+# Mean-center and round to 4 decimal places to remove floating-point discrepancies
+site_covs_fixed$X_scaled <- round(site_covs_fixed$Longitude - mean(site_covs_fixed$Longitude), 4)
+site_covs_fixed$Y_scaled <- round(site_covs_fixed$Latitude - mean(site_covs_fixed$Latitude), 4)
+
+# Compute N x N Euclidean distance matrix for JAGS
+coords_matrix <- as.matrix(site_covs_fixed[, c("X_scaled", "Y_scaled")])
+dist_matrix <- as.matrix(dist(coords_matrix, method = "euclidean"))
+
+# Final validation
+cat("\n[Validation Results]\n")
+cat("y_array station count:", length(all_sites_clean), "\n")
+cat("Distance matrix dimensions:", dim(dist_matrix)[1], "x", dim(dist_matrix)[2], "\n")
+
+if(nrow(dist_matrix) == length(all_sites_clean)) {
+  message("Success: Covariate data perfectly aligned with detection history array. Ready for JAGS modeling.")
+}
+```
+
+# Bayesian Multi-Species Occupancy Model Definition (JAGS)
+```{r}
+library(jagsUI)
+cat("
+model {
+  # ==========================================
+  # 1. Community Hyperparameters and Prior Distributions
+  # ==========================================
+  # Occupancy hyperparameters
+  mu_alpha_psi ~ dnorm(0, 0.1)
+  tau_alpha_psi ~ dgamma(0.1, 0.1)
+  
+  mu_beta_elev ~ dnorm(0, 0.1)
+  tau_beta_elev ~ dgamma(0.1, 0.1)
+  
+  # Habitat effect hyperparameters (mean for each category)
+  for(h in 1:n_habitats){
+    mu_beta_hab[h] ~ dnorm(0, 0.1)
+    tau_beta_hab[h] ~ dgamma(0.1, 0.1)
+  }
+  
+  # Detection probability hyperparameters
+  mu_alpha_p ~ dnorm(0, 0.1)
+  tau_alpha_p ~ dgamma(0.1, 0.1)
+  
+  # Year effect and spatial random effect precision
+  tau_year ~ dgamma(0.1, 0.1)
+  tau_spatial ~ dgamma(0.1, 0.1)
+  
+  # Spatial decay parameter (for distance matrix)
+  rho ~ dunif(0, 5) 
+
+  # ==========================================
+  # 2. Species-specific Parameters
+  # ==========================================
+  for (i in 1:n_species) {
+    alpha_psi[i] ~ dnorm(mu_alpha_psi, tau_alpha_psi)
+    beta_elev[i] ~ dnorm(mu_beta_elev, tau_beta_elev)
+    alpha_p[i]   ~ dnorm(mu_alpha_p, tau_alpha_p)
+    
+    # Habitat effects: species-specific preference for each habitat type
+    for(h in 1:n_habitats){
+      beta_hab[i, h] ~ dnorm(mu_beta_hab[h], tau_beta_hab[h])
+    }
+
+    # Year effects: annual occupancy fluctuations per species
+    for (t in 1:n_years) {
+      year_effect[i, t] ~ dnorm(0, tau_year) 
+    }
+  }
+
+  # ==========================================
+  # 3. Spatial Random Effect
+  # ==========================================
+  for(j in 1:n_sites){
+    # S[j] represents spatial error for site j
+    S[j] ~ dnorm(0, tau_spatial) 
+  }
+
+  # ==========================================
+  # 4. State Process and Observation Process (Hierarchical Formulation)
+  # ==========================================
+  for (i in 1:n_species) {
+    for (j in 1:n_sites) {
+      for (t in 1:n_years) { 
+        
+        # --- State Equation ---
+        logit(psi[i,j,t]) <- alpha_psi[i] + 
+                             beta_elev[i] * elevation[j] + 
+                             beta_hab[i, habitat[j]] + 
+                             S[j] + 
+                             year_effect[i,t]
+        
+        # True latent occupancy state
+        z[i,j,t] ~ dbern(psi[i,j,t]) 
+        
+        # --- Observation Equation ---
+        for (k in 1:n_occasions) {
+          logit(p_obs[i,j,t,k]) <- alpha_p[i]
+          # Observed detection 0/1 conditional on z and p
+          y[i,j,t,k] ~ dbern(z[i,j,t] * p_obs[i,j,t,k]) 
+        }
+      }
+    }
+  }
+
+  # ==========================================
+  # 5. Derived Quantities
+  # ==========================================
+  # Calculate annual summary metrics per species for manuscript tables
+  for (i in 1:n_species) {
+    for (t in 1:n_years) {
+      # Estimated number of occupied sites per species and year
+      # Sum of true latent states z across all sampled sites
+      n_occupied[i, t] <- sum(z[i, 1:n_sites, t])
+      
+      # Mean occupancy probability across sampled sites
+      # Average psi across all sampled sites
+      mean_psi[i, t] <- mean(psi[i, 1:n_sites, t])
+    }
+  }
+}
+", file = "multi_session_spatial_msom.txt")
+
+```
+
+
+# Fit Bayesian Occupancy Model in JAGS
+```{r}
+library(rjags)
+# --- Step A: Package Data ---
+# Ensure elevation_scaled and y_array are prepared
+jags_data <- list(
+  y = y_array,
+  n_species = dim(y_array)[1],
+  n_sites = dim(y_array)[2],
+  n_years = dim(y_array)[3],
+  n_occasions = dim(y_array)[4],
+  
+  elevation = elevation_scaled,    # Standardized elevation vector
+  habitat = habitat_vector,        # Habitat index vector
+  n_habitats = n_habitats,         # Total number of habitat categories
+  dist_matrix = dist_matrix        # N x N distance matrix
+)
+
+# Recommended: run pilot run with smaller n.iter when testing spatial random effects
+
+# --- Step B: Set Initial Values ---
+# If y = 1 (detected) while initial z = 0 (unoccupied), JAGS will produce an error.
+# Solution: Initialize latent matrix z to 1 across all dimensions.
+z_init <- array(1, dim = c(jags_data$n_species, jags_data$n_sites, jags_data$n_years))
+inits <- function() {
+  list(z = z_init, alpha_psi = rnorm(jags_data$n_species))
+}
+
+# --- Step C: Specify Monitored Parameters ---
+params_to_save <- c("alpha_psi",    # Baseline occupancy intercepts
+                    "beta_elev",    # Elevation coefficients
+                    "beta_hab",     # Habitat coefficients
+                    "year_effect",  # Year effects
+                    "S",            # Spatial/site random effects
+                    "alpha_p",      # Detection probabilities
+                    "n_occupied", 
+                    "mean_psi"
+                    )
+
+# --- Step D: Execute MCMC Sampling ---
+# Multi-species 4D model is computationally intensive; parallel = TRUE is recommended
+# Test run with n.iter = 1000; production runs typically require 30000-50000 iterations
+cat("Starting MCMC sampling in JAGS...\n")
+out <- jags(data = jags_data,
+            inits = inits,
+            parameters.to.save = params_to_save,
+            model.file = "multi_session_spatial_msom.txt",
+            n.chains = 3,       # Run 3 parallel Markov chains
+            n.iter = 1000,      # Total MCMC iterations
+            n.burnin = 50,      # Burn-in iterations
+            n.thin = 5,         # Thinning rate to reduce autocorrelation
+            parallel = TRUE)    # Multi-core parallel computing
+
+out <- jags(data = jags_data,
+            inits = inits,
+            parameters.to.save = params_to_save,
+            model.file = "multi_session_spatial_msom.txt",
+            n.chains = 3,       # Run 3 parallel Markov chains
+            n.iter = 50000,     # Total MCMC iterations
+            n.burnin = 5000,    # Burn-in iterations
+            n.thin = 5,         # Thinning rate to reduce autocorrelation
+            parallel = TRUE) 
+# --- Step E: Inspect Model Results ---
+print(out)
+
+# Check convergence (R-hat values)
+# R-hat < 1.1 indicates satisfactory chain convergence.
+jagsUI::traceplot(out, parameters = "beta_elev")
+jagsUI::traceplot(out, parameters = "beta_hab")
+
+```
+
+# (Archived) Collinearity Test between Habitat and Elevation
+```{r}
+library(ggplot2)
+
+# Plot elevation distribution across habitat types
+ggplot(camera_info, aes(x = Habitat, y = Elevation, fill = Habitat)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5) + # Add jitter to inspect sample distribution
+  theme_minimal() +
+  labs(title = "Elevation Distribution by Habitat",
+       x = "Habitat Type",
+       y = "Elevation (m)")
+
+anova_res <- aov(Elevation ~ Habitat, data = camera_info)
+summary(anova_res)
+
+# Calculate effect size (Eta-squared); values closer to 1 indicate stronger association
+install.packages("lsr")
+library(lsr)
+etaSquared(anova_res)
+```
+
+# Plot Forest Plot of Covariate Effects
+```{r }
+# Load required packages
+library(ggplot2)
+library(dplyr)
+library(tibble)
+library(stringr)
+
+# 1. Extract summary matrix from JAGS output and convert to data frame
+res_df <- as.data.frame(out$summary) %>%
+  rownames_to_column(var = "Parameter") %>%
+  # Filter for elevation (beta_elev) and habitat (beta_hab) parameters
+  filter(grepl("^beta_elev|^beta_hab", Parameter))
+
+# 2. Determine significance: significant if 95% Bayesian credible interval does not overlap 0
+res_df <- res_df %>%
+  mutate(Significant = ifelse(`2.5%` > 0 | `97.5%` < 0, "Significant", "Not Significant"))
+
+# 3. Parse parameter names to extract Species ID and Habitat ID
+res_df <- res_df %>%
+  mutate(
+    Species_ID = as.numeric(str_extract(Parameter, "(?<=\\[)\\d+")),
+    Hab_ID = str_extract(Parameter, "(?<=,)\\d+(?=\\])")
+  )
+
+# ================= Core Customization Settings =================
+
+# 4. Habitat label mapping
+# Map habitat indices to descriptive labels based on the reference table
+habitat_names <- c(
+  "1" = "E",  
+  "2" = "D", 
+  "3" = "MED",    
+  "4" = "C",        
+  "5" = "MCB",     
+  "6" = "B",     
+  "7" = "M"       
+)
+
+# Generate display labels for variables
+res_df <- res_df %>%
+  mutate(
+    Variable = case_when(
+      grepl("elev", Parameter) ~ "Elevation",
+      grepl("hab", Parameter) ~ habitat_names[Hab_ID],
+      TRUE ~ Parameter
+    )
+  )
+
+# 5. Species name and order mapping
+species_names <- c(
+  "1" = "Elaphodus cephalophus", 
+  "2" = "Muntiacus reevesi", 
+  "3" = "Sus scrofa", 
+  "4" = "Capricornis milneedwardsii"
+)
+res_df$Species <- species_names[as.character(res_df$Species_ID)]
+
+# Specify species panel layout order
+species_order <- c("Sus scrofa", 
+  "Capricornis milneedwardsii",
+  "Muntiacus reevesi",
+  "Elaphodus cephalophus"
+)
+# Convert Species to factor to fix panel order
+res_df$Species <- factor(res_df$Species, levels = species_order)
+
+# Fix y-axis display order (Elevation on top, habitats in sequence)
+var_levels <- c("Elevation", unname(habitat_names))
+res_df$Variable <- factor(res_df$Variable, levels = rev(var_levels)) # Reverse order so variables display top-to-bottom
+
+# ===================================================
+
+# 6. Generate forest plot using ggplot2
+forest_plot <- ggplot(res_df, aes(x = mean, y = Variable, color = Significant)) +
+  # Add vertical reference line at x = 0 (using linewidth)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.8) +
+  # Set point size and linewidth to avoid fatten deprecation warnings
+  geom_pointrange(aes(xmin = `2.5%`, xmax = `97.5%`), linewidth = 0.7, size = 0.5) +
+  # Facet by species
+  facet_wrap(~ Species, nrow = 2) + 
+  scale_color_manual(values = c("Significant" = "#d95f02", "Not Significant" = "#999999")) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    strip.text = element_text(face = "italic", size = 12), # Italicize Latin species names
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(linetype = "dotted", color = "gray80")
+  ) +
+  labs(
+    title = "Covariate Effects on Species Occupancy",
+    x = "Posterior Mean and 95% Credible Interval (Log-odds)",
+    y = "Environmental Variables"
+  )
+
+# Display plot
+print(forest_plot)
+```
+# Occupancy Metric Summary Table
+```{r}
+library(broom.mixed)
+library(dplyr)
+
+# Extract mean occupancy probability and number of occupied sites
+summary_table <- as.data.frame(out$summary) %>%
+  tibble::rownames_to_column("Parameter") %>%
+  filter(grepl("mean_psi|n_occupied", Parameter)) %>%
+  # Parse species and year IDs
+  mutate(
+    Species_ID = as.numeric(stringr::str_extract(Parameter, "(?<=\\[)\\d+")),
+    Year_ID = as.numeric(stringr::str_extract(Parameter, "(?<=,)\\d+(?=\\])"))
+  )
+
+# Replace species IDs with names
+species_names <- c(
+  "1" = "Elaphodus cephalophus", 
+  "2" = "Muntiacus reevesi", 
+  "3" = "Sus scrofa", 
+  "4" = "Capricornis milneedwardsii"
+)
+summary_table$Species <- species_names[as.character(summary_table$Species_ID)]
+
+print(summary_table[, c("Species", "Year_ID", "mean", "2.5%", "97.5%", "Parameter")])
+
+summary_table_export <- summary_table[, c("Species", "Year_ID", "mean", "2.5%", "97.5%", "Parameter")]
+library(writexl)
+write_xlsx(summary_table_export, "Occupancy_Metrics.xlsx")
+```
+# Occupancy Metrics Aggregated Across Years
+```{r}
+library(dplyr)
+library(tidyr)
+
+# 1. Extract posterior draws of n_occupied (dims: iterations x species x years)
+n_occ_sims <- out$sims.list$n_occupied 
+
+# 2. Compute inter-annual average per species across posterior iterations
+# Average over the 3rd dimension (years) to obtain mean performance per iteration
+spec_overall_n_occ <- apply(n_occ_sims, c(1, 2), mean) 
+spec_overall_psi <- apply(out$sims.list$mean_psi, c(1, 2), mean)
+
+# 3. Calculate summary statistics (mean and 95% credible intervals)
+get_summary <- function(sim_matrix, metric_name) {
+  data.frame(
+    Species_ID = 1:4,
+    Metric = metric_name,
+    Mean = apply(sim_matrix, 2, mean),
+    Lower = apply(sim_matrix, 2, quantile, probs = 0.025),
+    Upper = apply(sim_matrix, 2, quantile, probs = 0.975)
+  )
+}
+
+overall_summary <- rbind(
+  get_summary(spec_overall_n_occ, "Overall_n_occupied"),
+  get_summary(spec_overall_psi, "Overall_mean_psi")
+)
+
+# 4. Map species names
+species_names <- c(
+  "1" = "Elaphodus cephalophus", 
+  "2" = "Muntiacus reevesi", 
+  "3" = "Sus scrofa", 
+  "4" = "Capricornis milneedwardsii"
+)
+overall_summary$Species <- species_names[as.character(overall_summary$Species_ID)]
+
+# 5. Print final formatted summary table
+final_concise_report <- overall_summary %>%
+  select(Species, Metric, Mean, Lower, Upper) %>%
+  arrange(desc(Metric), desc(Mean))
+
+print(final_concise_report)
+write_xlsx(final_concise_report, "Occupancy_Metrics_merge_year.xlsx")
+```
+
+# Calculate Levins' Niche Breadth
+```{r}
+# Define Levins' niche breadth function: B = 1 / sum(p_i^2)
+# where p_i is the relative occupancy probability of a species in habitat i
+calc_niche_breadth <- function(out, spec_idx) {
+  # Extract beta_hab parameters across habitats for target species
+  # Note: Approximated via beta_hab logits; full prediction via psi recommended
+  hab_effects <- out$mean$beta_hab[spec_idx, ]
+  psi_hab <- exp(hab_effects) / (1 + exp(hab_effects)) # Convert logit to probability
+  p_relative <- psi_hab / sum(psi_hab)
+  B <- 1 / sum(p_relative^2)
+  return(B / length(hab_effects)) # Standardize to 0–1 scale
+}
+
+# Calculate niche breadth for four species
+niche_widths <- sapply(1:4, function(i) calc_niche_breadth(out, i))
+names(niche_widths) <- species_names
+print(niche_widths)
+```
+
+# Spatial Occupancy Map Visualization
+```{r}
+library(ggplot2)
+
+# Extract mean occupancy probability per site (j) for Year 1 (t = 1)
+# Requires "psi" in params_to_save
+# Note: If memory-constrained by large site arrays, monitor mean_psi instead
+site_psi <- data.frame(
+  Site = all_sites,
+  Psi_Mean = apply(out$sims.list$psi[, 1, , 1], 2, mean), # Species 1, Year 1
+  Longitude = site_covs_fixed$Longitude,
+  Latitude = site_covs_fixed$Latitude
+)
+
+ggplot(site_psi, aes(x = Longitude, y = Latitude, color = Psi_Mean)) +
+  geom_point(size = 3) +
+  scale_color_viridis_c(option = "plasma") +
+  theme_minimal() +
+  labs(title = "Species 1 Spatial Distribution Pattern (Predicted Occupancy)", color = "Occupancy (psi)")
+```

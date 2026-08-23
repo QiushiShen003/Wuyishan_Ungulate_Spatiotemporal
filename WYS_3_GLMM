@@ -1,0 +1,186 @@
+---
+title: "wys_5(3) GLMM"
+output: html_document
+date: "2025-12-15"
+---
+# Data Import and 3D Distance Calculation
+```{r}
+library(dplyr)
+library(ggplot2)
+library(DHARMa)
+library(readxl)
+library(tidyverse)
+camera_info <- read_excel("Camera_info_12_4.xlsx")
+#data <- read_excel("wys_data_12_3.xlsx")
+
+library(sf)
+camera_info_sf <- st_as_sf(camera_info, 
+                   coords = c("Longitude", "Latitude"), 
+                   crs = 4326)
+dist_matrix_2d <- st_distance(camera_info_sf)
+dist_matrix_2d <- as.numeric(dist_matrix_2d) 
+dim(dist_matrix_2d) <- c(nrow(camera_info), nrow(camera_info))
+
+elev_matrix <- outer(camera_info$Elevation, camera_info$Elevation, FUN = function(x, y) abs(x - y))
+dist_matrix_3d <- sqrt(dist_matrix_2d^2 + elev_matrix^2)
+
+diag(dist_matrix_3d) <- NA
+camera_info$nearest_dist_3d_m <- apply(dist_matrix_3d, 1, min, na.rm = TRUE)
+camera_info$nearest_dist_3d_km <- camera_info$nearest_dist_3d_m / 1000
+
+mean_3d <- mean(camera_info$nearest_dist_3d_m, na.rm = TRUE)
+
+min(camera_info$nearest_dist_3d_m)
+max(camera_info$nearest_dist_3d_m)
+
+ggplot(camera_info, aes(x = "All Cameras", y = nearest_dist_3d_m)) +
+  # Draw boxplot
+  geom_boxplot(fill = "#56B4E9", color = "black", width = 0.4, outlier.shape = NA) +
+  # Add jitter points to visualize individual camera distributions without overlap
+  geom_jitter(width = 0.1, alpha = 0.6, color = "#E69F00", size = 2) +
+  theme_bw() +
+  labs(
+    title = "Nearest Neighbor Distance Among Cameras",
+    subtitle = "Boxplot with individual camera distances",
+    x = "", 
+    y = "Nearest Distance (meters)"
+  ) +
+  theme(
+    axis.text.x = element_blank(), # Hide x-axis labels (single group)
+    axis.ticks.x = element_blank(),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+camera_info_arranged <- camera_info %>%
+  arrange(nearest_dist_3d_m)
+```
+
+# Spatial Thinning
+```{r}
+library(sf)
+library(dplyr)
+
+spatial_thinning <- function(df, threshold = 10) {
+  # 1. Convert to sf object to calculate exact great-circle distances
+  df_sf <- st_as_sf(df, coords = c("Longitude", "Latitude"), crs = 4326)
+  
+  # 2. Calculate distance matrix
+  dist_matrix <- st_distance(df_sf)
+  diag(dist_matrix) <- NA # Exclude diagonal self-distances (0)
+  
+  # Check for camera pairs below distance threshold
+  too_close <- which(dist_matrix < units::set_units(threshold, "m"), arr.ind = TRUE)
+  
+  if(nrow(too_close) == 0) {
+    message("All inter-camera distances exceed the threshold; no thinning needed.")
+    # Return sorted by Site if no thinning is required
+    return(df[order(df$Site), ])
+  }
+  
+  # 3. Greedy randomized thinning algorithm
+  keep_sites <- c()
+  remaining_sites <- 1:nrow(df)
+  
+  set.seed(123) # Ensure reproducibility
+  
+  while(length(remaining_sites) > 0) {
+    # Avoid single-element sampling issue in R base sample()
+    if (length(remaining_sites) == 1) {
+      pick <- remaining_sites
+    } else {
+      pick <- sample(remaining_sites, 1)
+    }
+    
+    # Retain selected camera
+    keep_sites <- c(keep_sites, pick)
+    
+    # Identify all neighbors within distance threshold
+    neighbors <- which(dist_matrix[pick, ] < units::set_units(threshold, "m"))
+    
+    # Remove current camera and adjacent neighbors from candidate pool
+    to_remove <- c(pick, neighbors)
+    remaining_sites <- setdiff(remaining_sites, to_remove)
+  }
+  
+  # 4. Subset retained spatially independent cameras
+  df_thinned <- df[keep_sites, ]
+  
+  # 5. Reorder output dataframe by Site
+  df_thinned <- df_thinned[order(df_thinned$Site), ]
+  
+  return(df_thinned)
+}
+
+# === Execute thinning ===
+# Thin cameras spaced < 10 meters apart
+camera_info_thinned <- spatial_thinning(camera_info, threshold = 10)
+
+# Print summary to verify output
+cat(sprintf("Spatial thinning complete: Original sites = %d, Retained sites = %d\n", 
+            nrow(camera_info), nrow(camera_info_thinned)))
+
+camera_info_thinned
+
+```
+
+# Prepare Data for Modeling
+```{r}
+# Format and merge data
+all_species <- unique(data$Species)
+all_sites <- unique(camera_info_thinned$Site)
+
+skeleton <- expand.grid(Species = all_species, Site = all_sites)
+
+counts <- data %>% group_by(Species, Site) %>%
+  summarise(Count = n(), .groups = "drop")
+
+data_glm <- skeleton %>% left_join(counts, by = c("Species","Site"))%>%
+  mutate(Count = replace_na(Count,0)) %>%
+  left_join(camera_info, by = "Site")
+```
+# Spatial Autocorrelation Test
+```{r}
+library(DHARMa) # For evaluating GLMM residuals
+library(spdep)  # For spatial analysis
+
+sim_res <- simulateResiduals(fittedModel = model_glmm1)
+# Aggregate residuals by site
+# group parameter must match the Site variable in the model
+sim_res_grouped <- recalculateResiduals(sim_res, group = data_glm$Site)
+
+# Step 2: Ensure coordinate order matches aggregated residuals
+# aggregate() sorts by Site alphanumeric order, matching recalculateResiduals default behavior
+site_locations <- aggregate(cbind(Longitude, Latitude) ~ Site, 
+                           data = data_glm, 
+                           FUN = mean)
+
+# Step 3: Run spatial autocorrelation test (Moran's I)
+testSpatialAutocorrelation(simulationOutput = sim_res_grouped, 
+                           x = site_locations$Longitude, 
+                           y = site_locations$Latitude)
+
+```
+
+# (Archived) GLM Modeling
+```{r}
+# Fit negative binomial GLMs
+library(MASS)     # For Negative Binomial GLM
+library(emmeans)
+model_nb <- glm.nb(Count ~ Species + Habitat + offset(log(duration)), 
+                   data = data_glm,
+                   maxit = 1000)
+
+summary(model_nb)
+
+anova(model_nb, test = "Chisq")
+
+model_nb_interact <- glm.nb(Count ~ Species * Habitat + offset(log(duration)), 
+                   data = data_glm,
+                   maxit = 1000)
+summary(model_nb_interact)
+
+anova(model_nb_interact, test = "Chisq")
+
+# Post-hoc pairwise contrasts
+emm_results <- emmeans(model

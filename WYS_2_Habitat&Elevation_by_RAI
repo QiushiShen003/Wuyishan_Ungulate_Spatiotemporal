@@ -1,0 +1,408 @@
+---
+title: "wys_2"
+output: html_document
+date: "2025-07-07"
+---
+
+```{r}
+library(readxl)
+camera_info <- read_excel("Camera_Info_12_4.xlsx")
+data <- read_excel("wys_data_12_3.xlsx")
+
+library(dplyr)
+camera_info <- camera_info %>% 
+  filter(Site %in% data$Site)
+camera_info
+
+library(tidyr)
+consistency_check <- data %>%
+  group_by(Site) %>%
+  summarise(
+    long_consist = n_distinct(Longitude) == 1,
+    lat_consist = n_distinct(Latitude) == 1,
+    True_long = ifelse(n_distinct(Longitude) == 1, first(Longitude), NA),
+    True_lat = ifelse(n_distinct(Latitude) == 1, first(Latitude), NA),
+    count = n(),
+    .groups = 'drop'
+  )
+
+inconsistent_points <- consistency_check %>%
+  filter(!long_consist | !lat_consist)
+
+if (nrow(inconsistent_points) > 0) {
+  print("Warning: The following site IDs have inconsistent longitude/latitude values:")
+  print(inconsistent_points)
+  
+  # View specific coordinate discrepancies for these sites
+  print("Detailed data for inconsistent sites:")
+  problematic_details <- data %>%
+    filter(Site %in% inconsistent_points$Site) %>%
+    arrange(Site)
+  print(problematic_details)
+  
+  # Stop execution or choose handling strategy
+  stop("Inconsistent coordinates detected across sites. Please resolve data quality issues first.")
+} else {
+  print("Check passed: Coordinates across all site IDs are completely consistent.")
+}
+
+data_gis <- data %>% select(Site, Longitude,Latitude)
+data_gis <- data_gis %>%
+  distinct(Site, .keep_all = TRUE)
+camera_info_gis <- camera_info %>% left_join(data_gis, by="Site")
+camera_info_gis
+
+library(openxlsx)
+write.xlsx(camera_info_gis, "camera_info_gis.xlsx",
+           colNames = TRUE,
+           rowNames = FALSE)
+
+```
+
+```{r}
+library(readxl)
+camera_info <- read_excel("Camera_Info.xlsx")
+data <- read_excel("wys_data_new.xlsx")
+library(dplyr)
+camera_info <- camera_info %>% 
+  filter(Site %in% data$Site)
+
+# Check whether habitat types match
+matched_data <- inner_join(
+  camera_info, 
+  data %>% select(Site, Habitat), 
+  by = "Site", 
+  suffix = c("_camera", "_data")
+)
+
+# Filter rows where Habitat values differ
+mismatched_rows <- matched_data %>%
+  filter(Habitat_camera != Habitat_data)
+
+# Output mismatched rows
+if (nrow(mismatched_rows) > 0) {
+  print("mismatched rows：")
+  print(mismatched_rows)
+} else {
+  print("all matched")
+}
+
+# Check for NA habitat types
+na_rows <- camera_info %>% filter(is.na(Habitat))
+# Output results
+print(na_rows)
+
+
+# Calculate camera operating trap nights (days) for each station
+camera_info <- camera_info %>%
+  mutate(across(c(Install, Check1, Check2, Check3), as.Date)) %>%
+  mutate(duration = case_when(
+    !is.na(Check3) ~ as.numeric(Check3 - Install),
+    !is.na(Check2) ~ as.numeric(Check2 - Install),
+    !is.na(Check1) ~ as.numeric(Check1 - Install),
+    TRUE ~ NA_real_
+  ))
+camera_info
+
+```
+# RAI by Habitat Type
+```{r}
+habitat_duration_summary <- camera_info %>%
+  group_by(Habitat) %>%
+  summarise(total_duration = sum(duration, na.rm = TRUE)) %>%
+  arrange(desc(total_duration))
+habitat_duration_summary
+
+data_ela <- subset(data, data$Species =="Sus scrofa")
+habitat_counts <- data_ela %>%
+  count(Habitat, name = "occur_numbers")
+habitat_counts
+
+# Plotting
+data_habitat <- read_excel("Habitat_RAI.xlsx")
+data_habitat
+data_habitat_sp <- subset(data_habitat,select = c("Habitat","MSRAI"))
+
+habitat_order <- unique(data_habitat_sp$Habitat)
+# Convert Habitat to factor and maintain original order
+data_habitat_sp$Habitat <- factor(data_habitat_sp$Habitat, levels = habitat_order)
+
+habitat_colors <- c("#006400","#A6761D","#6B8E23","#004225","#5F9EA0","#B3DE69","#F0E68C")
+names(habitat_colors) <- habitat_order
+
+library(ggplot2)
+ggplot(data_habitat_sp, aes(x = Habitat, y = MSRAI, fill = Habitat)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  labs(y = "RAI", x = "Habitat Type")+
+  scale_x_discrete(labels = c("E", "D", "MED", "C","MCB","B","M"))+
+  theme(text = element_text(size = 16))+
+  scale_fill_manual(values  = habitat_colors)
+
+#calculate overlap index
+rai_cols <- grep("RAI$", names(data_habitat))
+abundance_matrix <- data_habitat[, rai_cols]
+
+library(spaa)
+niche.overlap(abundance_matrix, method = "pianka")
+```
+
+# Seasonal RAI by Habitat Type
+```{r}
+# Monitoring duration by season
+camera_info
+library(dplyr)
+library(lubridate)
+library(purrr)
+camera_processed <- camera_info %>%
+  # Ensure columns are standard Date objects
+  mutate(across(c(Install, Check1, Check2, Check3), as.Date)) %>%
+  
+  # Determine the final 'Recollect' date
+  # coalesce finds the first non-NA value starting from Check3 backwards
+  mutate(Recollect = coalesce(Check3, Check2, Check1)) %>%
+  
+  # Calculate durations by expanding the date range
+  mutate(season_counts = map2(Install, Recollect, function(start, end) {
+    
+    # Valid check: ensure dates exist
+    if(is.na(start) | is.na(end) | end <= start) {
+      return(data.frame(Warm_Days = 0, Cold_Days = 0))
+    }
+    
+    # Create sequence of active days 
+    # NOTE: We use (end - 1) to calculate "Camera Nights" (standard standard ecology).
+    # If you want inclusive calendar days, remove the "- 1".
+    active_dates <- seq(from = start, to = end - 1, by = "day")
+    
+    # Extract months (1-12)
+    m <- month(active_dates)
+    
+    # Count based on month definition
+    # Warm: May(5) - Sep(9)
+    # Cold: Oct(10) - Apr(4)
+    warm_count <- sum(m %in% 5:9)
+    cold_count <- sum(m %in% c(10, 11, 12, 1, 2, 3, 4))
+    
+    return(data.frame(Warm_Days = warm_count, Cold_Days = cold_count))
+  })) %>%
+  
+  # Unnest the counts back into main columns
+  tidyr::unnest(season_counts)
+
+habitat_duration_summary_w <- camera_processed %>%
+  group_by(Habitat) %>%
+  summarise(total_duration_w = sum(Warm_Days, na.rm = TRUE))
+habitat_duration_summary_w
+
+habitat_duration_summary_c <- camera_processed %>%
+  group_by(Habitat) %>%
+  summarise(total_duration_c = sum(Cold_Days, na.rm = TRUE))
+habitat_duration_summary_c
+
+# Species counts
+data$month <- format(data$Date, "%m")
+data$month <- as.numeric(data$month)
+data_w <- subset(data, data$month >= 5 & data$month <= 9)
+data_c <- subset(data, data$month >= 10 \vert{} data$month <= 4)
+
+data_ela_w <- subset(data_w, data_w$Species =="Capricornis milneedwardsii")
+data_ela_c <- subset(data_c, data_c$Species =="Capricornis milneedwardsii")
+habitat_counts_w <- data_ela_w %>%
+  count(Habitat, name = "occur_numbers")
+habitat_counts_c <- data_ela_c %>%
+  count(Habitat, name = "occur_numbers")
+
+
+data_habitat <- read_excel("Habitat_RAI.xlsx")
+data_habitat
+
+#calculate overlap index
+rai_cols_c <- grep("RAI_c$", names(data_habitat))
+abundance_matrix_c <- data_habitat[, rai_cols_c]
+
+library(spaa)
+niche.overlap(abundance_matrix_c, method = "pianka")
+
+rai_cols_w <- grep("RAI_w$", names(data_habitat))
+abundance_matrix_w <- data_habitat[, rai_cols_w]
+
+niche.overlap(abundance_matrix_w, method = "pianka")
+
+# Plotting
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+# Convert Habitat to factor and maintain original order
+habitat_order <- unique(data_habitat$Habitat)
+data_habitat$Habitat <- factor(data_habitat$Habitat, levels = habitat_order)
+
+# 1. Reshape data for a single species (e.g., "TD")
+# Replace "TD" with your target species code (e.g., "RM", "WB")
+species_code <- "MS" 
+col_warm <- paste0(species_code, "RAI_w")
+col_cold <- paste0(species_code, "RAI_c")
+
+plot_data <- data_habitat %>%
+  # Select only Habitat and the specific species columns
+  select(Habitat, all_of(col_warm), all_of(col_cold)) %>%
+  # Pivot to long format so ggplot can group them
+  pivot_longer(
+    cols = c(all_of(col_warm), all_of(col_cold)),
+    names_to = "Season_Raw",
+    values_to = "RAI"
+  ) %>%
+  # Clean up the Season names for the plot
+  mutate(
+    Season = ifelse(grepl("_w$", Season_Raw), "Warm", "Cold"),
+    Season = factor(Season, levels = c("Warm", "Cold")) # Optional: Order the bars
+  )
+
+# 2. Create the Clustered Bar Graph
+ggplot(plot_data, aes(x = Habitat, y = RAI, fill = Season)) +
+  # position = "dodge" is what places the bars side-by-side (clustered)
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) + 
+  scale_x_discrete(labels = c("E", "D", "MED", "C","MCB","B","M"))+
+  labs(x = NULL, y = "RAI") +
+  
+  # Define your season colors here
+  scale_fill_manual(values = c("Warm" = "#E69F00", "Cold" = "#56B4E9")) + 
+  
+  theme_minimal() +
+  theme(
+    text = element_text(size = 16)
+    # Note: I removed 'legend.position = "none"' so you can see which color is which.
+    # If you truly want to hide the legend, uncomment the line below:
+    # legend.position = "none" 
+  )
+```
+
+# RAI by Elevation Zone
+```{r}
+
+mismatched_rows <- camera_info %>%
+  inner_join(data %>% select(Site, Altitude), by = "Site") %>%  # Merge common Sites
+  filter(Elevation != Altitude) %>%  # Filter rows where elevation != altitude
+  select(Site, Elevation, Altitude)  # Optional: keep only key columns
+
+# Output results
+if (nrow(mismatched_rows) > 0) {
+  cat("mismatched")
+  print(mismatched_rows)
+} else {
+  cat("all match")
+}
+
+classify_elevation <- function(elevation) {
+  case_when(
+    elevation < 400 ~ "<400m",
+    elevation >= 400 & elevation < 600 ~ "400-600m",
+    elevation >= 600 & elevation < 800 ~ "600-800m",
+    elevation >= 800 & elevation < 1000 ~ "800-1000m",
+    elevation >= 1000 & elevation < 1200 ~ "1000-1200m",
+    elevation >= 1200 & elevation < 1400 ~ "1200-1400m",
+    elevation >= 1400 & elevation < 1600 ~ "1400-1600m",
+    elevation >= 1600 & elevation < 1800 ~ "1600-1800m",
+    elevation >= 1800 & elevation < 2000 ~ "1800-2000m",
+    elevation >= 2000 ~ ">2000m"
+  )
+}
+
+# Add elevation classification column
+camera_info <- camera_info %>%
+  mutate(elevation_class = classify_elevation(Elevation))
+camera_info
+# Calculate total duration by elevation zone
+sum_elevation_duration <- camera_info %>%
+  group_by(elevation_class) %>%
+  summarise(
+    elevation_duration = sum(duration) )
+sum_elevation_duration
+
+# Subset target species
+data_ela <- subset(data, data$Species=="Capricornis milneedwardsii")
+
+# Merge the two datasets
+combined_data <- data_ela %>%
+  left_join(camera_info %>% select(Site, elevation_class), by = "Site")
+
+# Calculate record counts per elevation class
+summary_data <- combined_data %>%
+  group_by(elevation_class) %>%
+  summarise(
+    record_count = n())
+
+nadata <- combined_data %>% filter(is.na(combined_data$elevation_class))
+# Ensure elevation classes follow the correct sequence
+elevation_order <- c("<400m", "400-600m", "600-800m", "800-1000m", 
+                    "1000-1200m", "1200-1400m", "1400-1600m", 
+                    "1600-1800m", "1800-2000m", ">2000m")
+
+summary_data$elevation_class <- factor(summary_data$elevation_class, 
+                                     levels = elevation_order)
+
+summary_data
+
+# Plotting
+library(ggplot2)
+library(ggpubr)
+
+elevationRAI <- read_excel("elevation_RAI.xlsx")
+
+# Ordering
+elevation_order <- c("<400", "400-600", "600-800", "800-1000", "1000-1200", 
+                    "1200-1400", "1400-1600", "1600-1800", "1800-2000", ">2000")
+elevationRAI$Elevation_Interval <- factor(elevationRAI$Elevation_Interval, 
+                                        levels = elevation_order)
+
+# Create color gradient vector
+#color_palette <- colorRampPalette(c("lightblue", "#00004C"))(nlevels(elevationRAI$Elevation_Interval))
+
+# Draw bar plot
+ggplot(elevationRAI, aes(x = Elevation_Interval, y = TD_RAI)) +
+  geom_bar(stat = "identity", fill = "#00004C") +
+  labs(x = NULL, y = "RAI") +
+  theme_minimal() +
+  theme(text = element_text(size = 16), axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none")  # Hide legend
+
+#calculate overlap index
+elev_rai_cols <- grep("RAI$", names(elevationRAI))
+elev_abundance_matrix <- elevationRAI[, elev_rai_cols]
+
+library(spaa)
+niche.overlap(elev_abundance_matrix, method = "pianka")
+```
+
+# Seasonal RAI by Elevation Zone
+```{r}
+camera_processed <- camera_processed %>%
+  mutate(elevation_class = classify_elevation(Elevation))
+
+elev_duration_summary_w <- camera_processed %>%
+  group_by(elevation_class) %>%
+  summarise(total_duration_w = sum(Warm_Days, na.rm = TRUE))
+elev_duration_summary_w
+
+elev_duration_summary_c <- camera_processed %>%
+  group_by(elevation_class) %>%
+  summarise(total_duration_c = sum(Cold_Days, na.rm = TRUE))
+elev_duration_summary_c
+
+# Species counts
+data$month <- format(data$Date, "%m")
+data$month <- as.numeric(data$month)
+data <- data %>%
+  mutate(elevation_class = classify_elevation(Elevation))
+
+data_w <- subset(data, data$month >= 5 & data$month <= 9)
+data_c <- subset(data, data$month >= 10 \vert{} data$month <= 4)
+
+data_ela_w <- subset(data_w, data_w$Species =="Capricornis milneedwardsii")
+data_ela_c <- subset(data_c, data_c$Species =="Capricornis milneedwardsii")
+elev_counts_w <- data_ela_w %>%
+  count(elevation_class, name = "occur_numbers")
+elev_counts_c <- data_ela_c %>%
+  count(elevation_class, name = "occur_numbers")
+
+
+elevationRAI <- read_excel("

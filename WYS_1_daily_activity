@@ -1,0 +1,611 @@
+---
+title: "wys_1"
+output: html_document
+date: "2025-07-04"
+---
+
+```{r}
+library(dplyr)
+library(readxl)
+data <- read_excel("wys_data_12_3.xlsx")
+
+result <- data %>%
+  group_by(Site) %>%
+  filter(n_distinct(Habitat) == 4) %>%
+  arrange(Site)  # Sort by site ID for easy viewing
+
+# View results
+print(result)
+
+# Convert to site-specific accurate time
+library(hms)
+data <- data %>% mutate(Time_hms = as_hms(Time))
+data <- data %>%
+  mutate(time_radians = as.numeric(Time_hms)/ 86400 * 2 * pi)
+
+
+# Set fixed coordinates for the study area
+study_longitude <- 117.7  # Longitude: 117.7° E
+study_latitude <- 27.7    # Latitude: 27.7° N
+
+# Define function to calculate equation of time
+equation_of_time <- function(date) {
+    # Calculate day of the year
+    J <- as.numeric(format(date, "%j"))
+    
+    # Calculate equation of time (minutes)
+    B <- 2 * pi * (J - 81) / 365
+    Et <- 9.87 * sin(2*B) - 7.53 * cos(B) - 1.5 * sin(B)
+    
+    return(Et)
+}
+
+# Define conversion function !!! Note: Date was not properly incorporated into the correction here; see WYS_II_3_TomCat for the corrected version
+convert_to_solar_time <- function(Time) {
+    # Ensure input is in POSIXct format 
+    datetime <- as.POSIXct(Time)
+    
+    # Time zone offset (China is UTC+8)
+    timezone_offset <- 8
+    
+    # Calculate longitude time difference (4 minutes per degree)
+    longitude_time_diff <- (study_longitude - (timezone_offset * 15)) * 4 / 60
+    
+    # Calculate equation of time correction (hours)
+    et <- equation_of_time(as.Date(Time)) / 60
+    
+    # Convert time to decimal hours
+    hour <- as.numeric(format(Time, "%H"))
+    minute <- as.numeric(format(Time, "%M"))
+    second <- as.numeric(format(Time, "%S"))
+    
+    time_in_hours <- hour + minute/60 + second/3600
+    
+    # Calculate apparent solar time
+    solar_time <- time_in_hours + longitude_time_diff + et
+    
+    # Handle values exceeding 24 or below 0
+    solar_time <- solar_time %% 24
+    
+    return(solar_time)
+}
+
+# Apply conversion and create new column
+data$Time_adj <- sapply(data$Time, convert_to_solar_time)
+
+data$time_adjusted <- format(
+  as.POSIXct(
+    (data$Time_adj %/% 1) * 3600 +  # Convert integer hour part to seconds
+    (data$Time_adj %% 1) * 60 * 60,  # Convert decimal part to minutes and then to seconds
+    origin = "1970-01-01", 
+    tz = "UTC"
+  ), 
+  "%H:%M:%S"
+)
+
+data <- data %>%
+  mutate(Longitude = as.numeric(Longitude))
+data$time_adjusted <- as_hms(data$time_adjusted)
+data$TimeRad <- as.numeric(data$Time_adj) * 2 * pi/24
+data
+```
+
+
+# Diel Activity Pattern Modeling
+```{r}
+data$PtTime <- as.POSIXct(
+  paste(
+    format(data$Date, "%Y-%m-%d"),
+    format(data$time_adjusted, "%H:%M:%S")
+  ),
+  format = "%Y-%m-%d %H:%M:%S",
+  tz = "Asia/Shanghai"  
+)
+
+library(dplyr)
+# Directly filter columns containing NA values
+data_na_columns <- data %>% 
+  select(where(~any(is.na(.))))
+
+data_ela <- subset(data, data$Species=="Elaphodus cephalophus")
+data_munt <- subset(data, data$Species=="Muntiacus reevesi")
+data_sus <- subset(data, data$Species=="Sus scrofa")
+data_cap <- subset(data, data$Species=="Capricornis milneedwardsii")
+
+library(activity)
+solartime_model_ela <- solartime(
+  data_ela$PtTime, data_ela$Latitude, data_ela$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+solartime_model_s_ela <- fitact(solartime_model_ela$solar, sample = "data", reps = 1000)
+
+solartime_model_munt <- solartime(
+  data_munt$PtTime, data_munt$Latitude, data_munt$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+solartime_model_s_munt <- fitact(solartime_model_munt$solar, sample = "data", reps = 1000)
+
+solartime_model_sus <- solartime(
+  data_sus$PtTime, data_sus$Latitude, data_sus$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+solartime_model_s_sus <- fitact(solartime_model_sus$solar, sample = "data", reps = 1000)
+
+solartime_model_cap <- solartime(
+  data_cap$PtTime, data_cap$Latitude, data_cap$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+solartime_model_s_cap <- fitact(solartime_model_cap$solar, sample = "data", reps = 1000)
+```
+
+# Diel Activity Pattern Plotting
+```{r}
+plot_perfect_curve <- function(model, species_name = "") {
+  # 1. Extract underlying data and convert x-axis to hours
+  x_raw <- model@pdf[, 1] * 24 / (2 * pi)
+  y_density <- model@pdf[, 2]
+  
+  # Check if model includes bootstrapped confidence intervals (prevents error if reps parameter was omitted)
+  has_ci <- ncol(model@pdf) >= 5
+  if(has_ci) {
+    y_lower <- model@pdf[, 4]
+    y_upper <- model@pdf[, 5]
+  }
+  
+  # 2. Strictly sort x-axis values (crucial step to resolve line artifacts/discontinuities)
+  order_idx <- order(x_raw)
+  x_sorted <- x_raw[order_idx]
+  y_den_sorted <- y_density[order_idx]
+  
+  if(has_ci) {
+    y_low_sorted <- y_lower[order_idx]
+    y_up_sorted <- y_upper[order_idx]
+    y_max <- max(y_up_sorted, na.rm = TRUE)
+  } else {
+    y_max <- max(y_den_sorted, na.rm = TRUE)
+  }
+  
+  # 3. Plot continuous primary curve using base graphics engine
+  plot(x_sorted, y_den_sorted, type = "l", col = "black", lty = 1, lwd = 1.5,
+       xaxt = "n", ylab = "Density", xlab = "Time", main = species_name,
+       xlim = c(0, 24), ylim = c(0, y_max))
+  
+  # 4. Overlay confidence interval dashed lines
+  if(has_ci) {
+    lines(x_sorted, y_low_sorted, col = "black", lty = 3)
+    lines(x_sorted, y_up_sorted, col = "black", lty = 3)
+  }
+  
+  # 5. Add custom x-axis time ticks at the bottom
+  axis(side = 1, at = c(0, 6, 12, 18, 24), labels = c("0", "6:00", "12:00", "18:00", "24:00"))
+}
+
+# ==========================================
+# Step 2: Batch plot curves across target species using the defined function
+
+# Call plotting function sequentially for each model
+plot_perfect_curve(solartime_model_s_ela)
+plot_perfect_curve(solartime_model_s_munt)
+plot_perfect_curve(solartime_model_s_sus)
+plot_perfect_curve(solartime_model_s_cap)
+
+# Original plotting code
+plot(solartime_model_s_ela, xunit="hours", yunit="density", xaxis = list(xaxt = "n"),
+     data = "none",
+     tline=list(col="black"),
+     cline=list(col="black", lwd=1, lty=3),
+     centre="day", ylab="Density", xlab="Time")
+axis(side = 1,
+     at = c(0, 6, 12, 18, 24),     # Tick hour marks
+     labels = c("0", "6:00", "12:00", "18:00", "24:00"))
+
+```
+
+# Interspecific Comparisons
+```{r}
+test_result <- compareCkern(solartime_model_s_cap, solartime_model_s_munt, reps = 1000)
+test_result
+
+library(overlap)
+time_cap <- solartime_model_cap$solar 
+time_munt <- solartime_model_munt$solar
+time_sus <- solartime_model_sus$solar 
+time_ela <- solartime_model_ela$solar
+
+obs_delta <- overlapEst(time_cap, time_ela, type = "Dhat4")
+
+set.seed(123)
+boot_delta <- bootstrap(time_cap, time_ela, nb = 1000, type = "Dhat4")
+
+ci_delta <- bootCI(obs_delta, boot_delta)
+# Use norm0 CI
+```
+
+
+# Seasonal Comparisons Within Species
+```{r}
+library(activity)
+data$month <- format(data$Date, "%m")
+data$month <- as.numeric(data$month)
+
+data_ela <- subset(data, data$Species=="Elaphodus cephalophus")
+data_munt <- subset(data, data$Species=="Muntiacus reevesi")
+data_sus <- subset(data, data$Species=="Sus scrofa")
+data_cap <- subset(data, data$Species=="Capricornis milneedwardsii")
+
+data_ela_w <- subset(data_ela, data_ela$month >= 5 & data_ela$month <= 9)
+data_ela_c <- subset(data_ela, data_ela$month >= 10 | data_ela$month <= 4)
+
+data_munt_w <- subset(data_munt, data_munt$month >= 5 & data_munt$month <= 9)
+data_munt_c <- subset(data_munt, data_munt$month >= 10 | data_munt$month <= 4)
+
+data_sus_w <- subset(data_sus, data_sus$month >= 5 & data_sus$month <= 9)
+data_sus_c <- subset(data_sus, data_sus$month >= 10 | data_sus$month <= 4)
+
+data_cap_w <-subset(data_cap, data_cap$month >= 5 & data_cap$month <= 9)
+data_cap_c <- subset(data_cap, data_cap$month >= 10 | data_cap$month <= 4)
+
+# tufted deer
+model_ela_w <- solartime(
+  data_ela_w$PtTime, data_ela_w$Latitude, data_ela_w$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_ela_w <- fitact(model_ela_w$solar, sample = "model")
+
+model_ela_c <- solartime(
+  data_ela_c$PtTime, data_ela_c$Latitude, data_ela_c$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_ela_c <- fitact(model_ela_c$solar, sample = "model")
+
+test_result_ela <- compareCkern(model_s_ela_c, model_s_ela_w, reps = 1000)
+test_result_ela
+
+# muntjac
+model_munt_w <- solartime(
+  data_munt_w$PtTime, data_munt_w$Latitude, data_munt_w$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_munt_w <- fitact(model_munt_w$solar, sample = "model")
+
+model_munt_c <- solartime(
+  data_munt_c$PtTime, data_munt_c$Latitude, data_munt_c$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_munt_c <- fitact(model_munt_c$solar, sample = "model")
+
+test_result_munt <- compareCkern(model_s_munt_c, model_s_munt_w, reps = 1000)
+test_result_munt
+
+# wild boar
+model_sus_w <- solartime(
+  data_sus_w$PtTime, data_sus_w$Latitude, data_sus_w$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_sus_w <- fitact(model_sus_w$solar, sample = "model")
+
+model_sus_c <- solartime(
+  data_sus_c$PtTime, data_sus_c$Latitude, data_sus_c$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_sus_c <- fitact(model_sus_c$solar, sample = "model")
+
+test_result_sus <- compareCkern(model_s_sus_c, model_s_sus_w, reps = 1000)
+test_result_sus
+
+# serow
+model_cap_w <- solartime(
+  data_cap_w$PtTime, data_cap_w$Latitude, data_cap_w$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_cap_w <- fitact(model_cap_w$solar, sample = "model")
+
+model_cap_c <- solartime(
+  data_cap_c$PtTime, data_cap_c$Latitude, data_cap_c$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_cap_c <- fitact(model_cap_c$solar, sample = "model")
+
+test_result_cap <- compareCkern(model_s_cap_c, model_s_cap_w, reps = 1000)
+test_result_cap
+
+```
+
+# Interspecific Comparisons Within the Same Season
+```{r}
+# same season between species
+# warm season
+test_result_ela_munt <- compareCkern(model_s_ela_w, model_s_munt_w, reps = 1000)
+test_result_ela_munt
+test_result_ela_sus <- compareCkern(model_s_ela_w, model_s_sus_w, reps = 1000)
+test_result_ela_sus
+test_result_ela_cap <- compareCkern(model_s_ela_w, model_s_cap_w, reps = 1000)
+test_result_ela_cap
+test_result_munt_sus <- compareCkern(model_s_munt_w, model_s_sus_w, reps = 1000)
+test_result_munt_sus
+test_result_munt_cap <- compareCkern(model_s_cap_w, model_s_munt_w, reps = 1000)
+test_result_munt_cap
+test_result_sus_cap <- compareCkern(model_s_cap_w, model_s_sus_w, reps = 1000)
+test_result_sus_cap
+
+# cold season
+test_result_c_ela_munt <- compareCkern(model_s_ela_c, model_s_munt_c, reps = 1000)
+test_result_c_ela_munt
+test_result_c_ela_sus <- compareCkern(model_s_ela_c, model_s_sus_c, reps = 1000)
+test_result_c_ela_sus
+test_result_c_ela_cap <- compareCkern(model_s_ela_c, model_s_cap_c, reps = 1000)
+test_result_c_ela_cap
+test_result_c_munt_sus <- compareCkern(model_s_munt_c, model_s_sus_c, reps = 1000)
+test_result_c_munt_sus
+test_result_c_munt_cap <- compareCkern(model_s_cap_c, model_s_munt_c, reps = 1000)
+test_result_c_munt_cap
+test_result_c_sus_cap <- compareCkern(model_s_cap_c, model_s_sus_c, reps = 1000)
+test_result_c_sus_cap
+
+```
+
+# Batch Calculate 95% Confidence Intervals for Comparisons Above
+```{r}
+library(overlap)
+library(dplyr)
+library(purrr) # For efficient batch iteration and mapping
+
+# ==========================================
+# Step 1: Define an efficient wrapper function to calculate overlap and CI
+# ==========================================
+calc_overlap_ci <- function(rad1, rad2, pair_name, reps = 1000) {
+  
+  # 1. Obtain sample sizes
+  n1 <- length(rad1[!is.na(rad1)])
+  n2 <- length(rad2[!is.na(rad2)])
+  
+  # 2. Automatically select estimator based on sample size (Dhat4 for n >= 50, Dhat1 for n < 50)
+  est_type <- ifelse(min(n1, n2) >= 50, "Dhat4", "Dhat1")
+  
+  # 3. Calculate observed overlap coefficient (Delta)
+  obs <- overlapEst(rad1, rad2, type = est_type)
+  
+  # 4. Run bootstrap (set random seed for reproducibility)
+  set.seed(123)
+  boot_res <- bootstrap(rad1, rad2, nb = reps, type = est_type)
+  
+  # 5. Extract norm0 confidence intervals
+  ci <- bootCI(obs, boot_res)
+  
+  # 6. Return a tidy data frame row
+  return(data.frame(
+    Comparison = pair_name,
+    Delta = as.numeric(obs),
+    CI_Lower = ci["norm0", "lower"],
+    CI_Upper = ci["norm0", "upper"],
+    Estimator = est_type,
+    Sample_Size_1 = n1,
+    Sample_Size_2 = n2,
+    stringsAsFactors = FALSE
+  ))
+}
+
+# ==========================================
+# Step 2: Build comparison task list
+# Note: $solar from the fitted solartime models contains the required radian data
+# ==========================================
+
+# A. Seasonal comparisons within species
+season_tasks <- list(
+  list(name = "TuftedDeer_Warm_vs_Cold", rad1 = model_ela_w$solar, rad2 = model_ela_c$solar),
+  list(name = "Muntjac_Warm_vs_Cold",    rad1 = model_munt_w$solar, rad2 = model_munt_c$solar),
+  list(name = "WildBoar_Warm_vs_Cold",   rad1 = model_sus_w$solar, rad2 = model_sus_c$solar),
+  list(name = "Serow_Warm_vs_Cold",      rad1 = model_cap_w$solar, rad2 = model_cap_c$solar)
+)
+
+# B. Interspecific comparisons in warm season
+warm_tasks <- list(
+  list(name = "Warm_Ela_vs_Munt", rad1 = model_ela_w$solar, rad2 = model_munt_w$solar),
+  list(name = "Warm_Ela_vs_Sus",  rad1 = model_ela_w$solar, rad2 = model_sus_w$solar),
+  list(name = "Warm_Ela_vs_Cap",  rad1 = model_ela_w$solar, rad2 = model_cap_w$solar),
+  list(name = "Warm_Munt_vs_Sus", rad1 = model_munt_w$solar, rad2 = model_sus_w$solar),
+  list(name = "Warm_Munt_vs_Cap", rad1 = model_munt_w$solar, rad2 = model_cap_w$solar),
+  list(name = "Warm_Sus_vs_Cap",  rad1 = model_sus_w$solar, rad2 = model_cap_w$solar)
+)
+
+# C. Interspecific comparisons in cold season
+cold_tasks <- list(
+  list(name = "Cold_Ela_vs_Munt", rad1 = model_ela_c$solar, rad2 = model_munt_c$solar),
+  list(name = "Cold_Ela_vs_Sus",  rad1 = model_ela_c$solar, rad2 = model_sus_c$solar),
+  list(name = "Cold_Ela_vs_Cap",  rad1 = model_ela_c$solar, rad2 = model_cap_c$solar),
+  list(name = "Cold_Munt_vs_Sus", rad1 = model_munt_c$solar, rad2 = model_sus_c$solar),
+  list(name = "Cold_Munt_vs_Cap", rad1 = model_munt_c$solar, rad2 = model_cap_c$solar),
+  list(name = "Cold_Sus_vs_Cap",  rad1 = model_sus_c$solar, rad2 = model_cap_c$solar)
+)
+
+# Combine all tasks into a single list
+all_tasks <- c(season_tasks, warm_tasks, cold_tasks)
+
+
+# ==========================================
+# Step 3: Batch compute and generate results table
+# ==========================================
+
+cat("Starting 16 bootstrap calculations (1000 reps each). This may take 1-2 minutes. Please wait...\n")
+
+# Iterate through tasks using map_dfr and bind rows into a tidy data frame
+final_ci_table <- map_dfr(all_tasks, function(task) {
+  calc_overlap_ci(task$rad1, task$rad2, pair_name = task$name, reps = 1000)
+})
+
+# Round numeric metrics to three decimal places
+final_ci_table <- final_ci_table %>%
+  mutate(across(c(Delta, CI_Lower, CI_Upper), ~round(., 3)))
+
+# Print final results
+print(final_ci_table)
+
+# (Optional) Export to Excel for manuscript tables
+# library(writexl)
+# write_xlsx(final_ci_table, "Seasonal_and_Species_Overlap_CIs.xlsx")
+
+```
+
+# Seasonal Comparison Plotting
+```{r}
+library(ggplot2)
+library(overlap)
+data$TimeRad <- as.numeric(data$Time_adj) * 2 * pi/24
+data_ela <- subset(data, data$Species=="Elaphodus cephalophus")
+data_munt <- subset(data, data$Species=="Muntiacus reevesi")
+data_sus <- subset(data, data$Species=="Sus scrofa")
+data_cap <- subset(data, data$Species=="Capricornis milneedwardsii")
+
+data_ela_w <- subset(data_ela, data_ela$month >= 5 & data_ela$month <= 9)
+data_ela_c <- subset(data_ela, data_ela$month >= 10 | data_ela$month <= 4)
+
+data_munt_w <- subset(data_munt, data_munt$month >= 5 & data_munt$month <= 9)
+data_munt_c <- subset(data_munt, data_munt$month >= 10 | data_munt$month <= 4)
+
+data_sus_w <- subset(data_sus, data_sus$month >= 5 & data_sus$month <= 9)
+data_sus_c <- subset(data_sus, data_sus$month >= 10 | data_sus$month <= 4)
+
+data_cap_w <-subset(data_cap, data_cap$month >= 5 & data_cap$month <= 9)
+data_cap_c <- subset(data_cap, data_cap$month >= 10 | data_cap$month <= 4)
+
+overlap_ela_munt_w <- overlapEst(data_ela_w$TimeRad, data_munt_w$TimeRad)
+overlap_ela_munt_c <- overlapEst(data_ela_c$TimeRad, data_munt_c$TimeRad)
+
+sample_size_warm <- as.numeric(nrow(data_munt_w))
+sample_size_cold <- as.numeric(nrow(data_munt_c))
+
+densityPlot(data_munt_w$TimeRad, 
+           xscale = 24,
+           main = "Mainland Serow Daily Activity Pattern by Altitude",
+           xlab = "Time (hours)",
+           ylab = "Activity Density",
+           ylim = c(0, 0.1),
+           lwd = 2, 
+           col = "gold",  
+           xaxt = "n")   # Suppress default x-axis initially
+
+# Add cold season data
+densityPlot(data_munt_c$TimeRad, 
+           add = TRUE,  # Add to existing plot
+           lwd = 2,
+           col = "darkblue") 
+
+# Customize x-axis (24-hour clock)
+axis(1, at = seq(0, 24, by = 6), labels = seq(0, 24, by = 6))
+
+# Add legend
+legend("topright", 
+       legend = c(paste("warm (May-Sep, n=", sample_size_warm, ")", sep = ""),
+                 paste("cold (Oct-Apr, n=", sample_size_cold, ")", sep = "")),
+       col = c("gold","darkblue"), 
+       lty = 1, 
+       lwd = 2,
+       bty = "n")  # No border
+```
+
+# Diel Activity Patterns Across Elevational Zones
+```{r}
+data_ela_low <- subset(data_ela, Altitude <= 899)
+data_ela_mid <- subset(data_ela, Altitude >= 900 & Altitude <= 1499)
+data_ela_high <- subset(data_ela, Altitude >= 1500)
+
+data_munt_low <- subset(data_munt, Altitude <= 899)
+data_munt_mid <- subset(data_munt, Altitude >= 900 & Altitude <= 1499)
+data_munt_high <- subset(data_munt, Altitude >= 1500)
+
+data_sus_low <- subset(data_sus, Altitude <= 899)
+data_sus_mid <- subset(data_sus, Altitude >= 900 & Altitude <= 1499)
+data_sus_high <- subset(data_sus, Altitude >= 1500)
+
+data_cap_low <- subset(data_cap, Altitude <= 899)
+data_cap_mid <- subset(data_cap, Altitude >= 900 & Altitude <= 1499)
+data_cap_high <- subset(data_cap, Altitude >= 1500)
+
+# Sample sizes
+sample_size_low <- as.numeric(nrow(data_munt_low))
+sample_size_mid <- as.numeric(nrow(data_munt_mid))
+sample_size_high <- as.numeric(nrow(data_munt_high))
+
+par(mar = c(5, 4, 4, 2) + 0.1)  # Adjust margins
+
+# Plot high elevation data first (as baseline)
+densityPlot(data_munt_high$TimeRad,  
+           xscale = 24,
+           main = "Reeves's muntjac Diel Activity Pattern by Altitude",
+           xlab = "Time (hours)",
+           ylab = "Activity Density",
+           ylim = c(0, 0.1),
+           lwd = 2, 
+           col = "darkred",  # Dark red for high elevation
+           xaxt = "n")   # Suppress default x-axis initially
+
+# Add mid-elevation data
+densityPlot(data_munt_mid$TimeRad, 
+           add = TRUE,  # Add to existing plot
+           lwd = 2,
+           col = "red") # Red for mid elevation
+
+# Add low-elevation data
+densityPlot(data_munt_low$TimeRad, 
+           add = TRUE,  # Add to existing plot
+           lwd = 2,
+           col = "orange") # Orange for low elevation
+
+# Customize x-axis (24-hour clock)
+axis(1, at = seq(0, 24, by = 6), labels = seq(0, 24, by = 6))
+
+# Add legend
+legend("topright", 
+       legend = c(paste("Low (<900m, n=", sample_size_low, ")", sep = ""),
+                 paste("Mid (900-1500m, n=", sample_size_mid, ")", sep = ""),
+                 paste("High (>1500m, n=", sample_size_high, ")", sep = "")),
+       col = c("orange", "red", "darkred"), 
+       lty = 1, 
+       lwd = 2,
+       bty = "n")  # No border
+
+```
+
+# Elevational Delta and P-values
+```{r}
+# tufted deer
+model_ela_low <- solartime(
+  data_ela_low$PtTime, data_ela_low$Latitude, data_ela_low$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_ela_low <- fitact(model_ela_low$solar, sample = "model")
+
+model_ela_mid <- solartime(
+  data_ela_mid$PtTime, data_ela_mid$Latitude, data_ela_mid$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_ela_mid <- fitact(model_ela_mid$solar, sample = "model")
+
+model_ela_high <- solartime(
+  data_ela_high$PtTime, data_ela_high$Latitude, data_ela_high$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_ela_high <- fitact(model_ela_high$solar, sample = "model")
+
+test_result_ela <- compareCkern(model_s_ela_mid, model_s_ela_high, reps = 1000)
+test_result_ela
+
+# muntjac
+model_munt_low <- solartime(
+  data_munt_low$PtTime, data_munt_low$Latitude, data_munt_low$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_munt_low <- fitact(model_munt_low$solar, sample = "model")
+
+model_munt_mid <- solartime(
+  data_munt_mid$PtTime, data_munt_mid$Latitude, data_munt_mid$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_munt_mid <- fitact(model_munt_mid$solar, sample = "model")
+
+model_munt_high <- solartime(
+  data_munt_high$PtTime, data_munt_high$Latitude, data_munt_high$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_munt_high <- fitact(model_munt_high$solar, sample = "model")
+
+test_result_munt <- compareCkern(model_s_munt_mid, model_s_munt_high, reps = 1000)
+test_result_munt
+
+# wild boar
+model_sus_low <- solartime(
+  data_sus_low$PtTime, data_sus_low$Latitude, data_sus_low$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_sus_low <- fitact(model_sus_low$solar, sample = "model")
+
+model_sus_mid <- solartime(
+  data_sus_mid$PtTime, data_sus_mid$Latitude, data_sus_mid$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_sus_mid <- fitact(model_sus_mid$solar, sample = "model")
+
+model_sus_high <- solartime(
+  data_sus_high$PtTime, data_sus_high$Latitude, data_sus_high$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_sus_high <- fitact(model_sus_high$solar, sample = "model")
+
+test_result_sus <- compareCkern(model_s_sus_mid, model_s_sus_high, reps = 1000)
+test_result_sus
+
+# serow
+model_cap_low <- solartime(
+  data_cap_low$PtTime, data_cap_low$Latitude, data_cap_low$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_cap_low <- fitact(model_cap_low$solar, sample = "model")
+
+model_cap_mid <- solartime(
+  data_cap_mid$PtTime, data_cap_mid$Latitude, data_cap_mid$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_cap_mid <- fitact(model_cap_mid$solar, sample = "model")
+
+model_cap_high <- solartime(
+  data_cap_high$PtTime, data_cap_high$Latitude, data_cap_high$Longitude, tz = 8, format = "%Y-%m-%d %H:%M:%S")
+model_s_cap_high <- fitact(model_cap_high$solar, sample = "model")
+
+test_result_cap <- compareCkern(model_s_cap_mid, model_s_cap_high, reps = 1000)
+test_result_cap
+
+```
